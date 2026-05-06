@@ -57,9 +57,9 @@ jobs:
       extra_semgrep_rules: "p/owasp-top-ten"  # Extra rules
 ```
 
-### Required Organization Secrets
+### Required Secrets
 
-Configure at **Organization > Settings > Secrets > Actions**:
+**Organization level** (Settings > Secrets > Actions — shared by all repos):
 
 | Secret | Description |
 |---|---|
@@ -67,4 +67,12 @@ Configure at **Organization > Settings > Secrets > Actions**:
 | `AZURE_CLIENT_ID` | App registration client ID |
 | `AZURE_CLIENT_SECRET` | App registration secret |
 | `MAIL_SENDER` | Sender email (must be a real mailbox) |
-| `NOTIFY_EMAIL` | Default recipients (semicolon-separated) |
+
+**Repository level** (each repo configures its own):
+
+| Secret | Description |
+|---|---|
+| `NOTIFY_EMAIL` | Recipients for this repo's scan report (semicolon-separated) |
+
+> Each repo sets its own `NOTIFY_EMAIL` so scan results go to the right team.
+> If not set at repo level, it falls back to the org-level secret (if configured).

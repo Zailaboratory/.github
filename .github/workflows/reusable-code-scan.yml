@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       notify_email:
-        description: "Override recipient email (semicolon-separated). Falls back to org secret NOTIFY_EMAIL."
+        description: "Override recipient email (semicolon-separated). Falls back to repo/org secret NOTIFY_EMAIL."
         type: string
         required: false
         default: ''
@@ -43,7 +43,8 @@ on:
       MAIL_SENDER:
         required: true
       NOTIFY_EMAIL:
-        required: true
+        required: false
+        description: "Recipient email (semicolon-separated). Set at REPO level so each repo sends to its own team."
 
 permissions:
   contents: read
