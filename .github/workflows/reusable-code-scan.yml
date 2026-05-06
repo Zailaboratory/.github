@@ -59,11 +59,14 @@ jobs:
       has_node: ${{ steps.detect.outputs.has_node }}
       has_go: ${{ steps.detect.outputs.has_go }}
       has_java: ${{ steps.detect.outputs.has_java }}
+      has_dotnet: ${{ steps.detect.outputs.has_dotnet }}
       has_rust: ${{ steps.detect.outputs.has_rust }}
       has_docker: ${{ steps.detect.outputs.has_docker }}
       python_root: ${{ steps.detect.outputs.python_root }}
       node_root: ${{ steps.detect.outputs.node_root }}
       go_root: ${{ steps.detect.outputs.go_root }}
+      dotnet_root: ${{ steps.detect.outputs.dotnet_root }}
+      java_root: ${{ steps.detect.outputs.java_root }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -113,10 +116,28 @@ jobs:
             GO_ROOT="backend"
           fi
 
-          # Java detection
+          # Java/Kotlin detection
           HAS_JAVA=false
+          JAVA_ROOT="."
           if [ -f pom.xml ] || [ -f build.gradle ] || [ -f build.gradle.kts ]; then
             HAS_JAVA=true
+          elif find . -maxdepth 2 -name "pom.xml" -o -name "build.gradle" | grep -q .; then
+            HAS_JAVA=true
+            JAVA_ROOT=$(dirname "$(find . -maxdepth 2 \( -name "pom.xml" -o -name "build.gradle" \) -print -quit)")
+          fi
+
+          # .NET/C# detection
+          HAS_DOTNET=false
+          DOTNET_ROOT="."
+          if find . -maxdepth 3 -name "*.csproj" -o -name "*.sln" -o -name "*.fsproj" | grep -q .; then
+            HAS_DOTNET=true
+            SLN_FILE=$(find . -maxdepth 2 -name "*.sln" -print -quit)
+            if [ -n "$SLN_FILE" ]; then
+              DOTNET_ROOT=$(dirname "$SLN_FILE")
+            else
+              CSPROJ_FILE=$(find . -maxdepth 3 -name "*.csproj" -print -quit)
+              [ -n "$CSPROJ_FILE" ] && DOTNET_ROOT=$(dirname "$CSPROJ_FILE")
+            fi
           fi
 
           # Rust detection
@@ -135,17 +156,21 @@ jobs:
           echo "has_node=$HAS_NODE" >> "$GITHUB_OUTPUT"
           echo "has_go=$HAS_GO" >> "$GITHUB_OUTPUT"
           echo "has_java=$HAS_JAVA" >> "$GITHUB_OUTPUT"
+          echo "has_dotnet=$HAS_DOTNET" >> "$GITHUB_OUTPUT"
           echo "has_rust=$HAS_RUST" >> "$GITHUB_OUTPUT"
           echo "has_docker=$HAS_DOCKER" >> "$GITHUB_OUTPUT"
           echo "python_root=$PYTHON_ROOT" >> "$GITHUB_OUTPUT"
           echo "node_root=$NODE_ROOT" >> "$GITHUB_OUTPUT"
           echo "go_root=$GO_ROOT" >> "$GITHUB_OUTPUT"
+          echo "dotnet_root=$DOTNET_ROOT" >> "$GITHUB_OUTPUT"
+          echo "java_root=$JAVA_ROOT" >> "$GITHUB_OUTPUT"
 
           echo "=== Detection Results ==="
           echo "Python: $HAS_PYTHON (root: $PYTHON_ROOT)"
           echo "Node.js: $HAS_NODE (root: $NODE_ROOT)"
           echo "Go: $HAS_GO (root: $GO_ROOT)"
-          echo "Java: $HAS_JAVA"
+          echo "Java: $HAS_JAVA (root: $JAVA_ROOT)"
+          echo ".NET/C#: $HAS_DOTNET (root: $DOTNET_ROOT)"
           echo "Rust: $HAS_RUST"
           echo "Docker: $HAS_DOCKER"
 
@@ -384,6 +409,104 @@ jobs:
             staticcheck-report.txt
             semgrep-go-report.txt
 
+  java-scan:
+    name: Java/Kotlin Scan
+    runs-on: ubuntu-latest
+    needs: detect-stack
+    if: needs.detect-stack.outputs.has_java == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Semgrep - Java SAST
+        run: |
+          pip install semgrep
+          JAVA_ROOT="${{ needs.detect-stack.outputs.java_root }}"
+          cd "$JAVA_ROOT"
+          semgrep scan --config auto --config p/java --config p/security-audit \
+            --text --output "$GITHUB_WORKSPACE/semgrep-java-report.txt" . || true
+        continue-on-error: true
+
+      - name: SpotBugs (if Maven project)
+        run: |
+          JAVA_ROOT="${{ needs.detect-stack.outputs.java_root }}"
+          cd "$JAVA_ROOT"
+          if [ -f pom.xml ]; then
+            mvn compile com.github.spotbugs:spotbugs-maven-plugin:spotbugs \
+              -DskipTests -q 2>/dev/null || true
+            [ -f target/spotbugsXml.xml ] && \
+              mvn com.github.spotbugs:spotbugs-maven-plugin:spotbugs \
+                -DskipTests -Dspotbugs.outputFormat=text 2>/dev/null | \
+                tee "$GITHUB_WORKSPACE/spotbugs-report.txt" || true
+          fi
+          [ ! -f "$GITHUB_WORKSPACE/spotbugs-report.txt" ] && echo "" > "$GITHUB_WORKSPACE/spotbugs-report.txt"
+        continue-on-error: true
+
+      - name: Upload Java reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-reports
+          path: |
+            semgrep-java-report.txt
+            spotbugs-report.txt
+
+  dotnet-scan:
+    name: .NET/C# Scan
+    runs-on: ubuntu-latest
+    needs: detect-stack
+    if: needs.detect-stack.outputs.has_dotnet == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.x'
+
+      - name: Restore & Build
+        run: |
+          DOTNET_ROOT="${{ needs.detect-stack.outputs.dotnet_root }}"
+          cd "$DOTNET_ROOT"
+          dotnet restore 2>/dev/null || true
+          dotnet build --no-restore -v q 2>/dev/null || true
+        continue-on-error: true
+
+      - name: dotnet format (code style)
+        run: |
+          DOTNET_ROOT="${{ needs.detect-stack.outputs.dotnet_root }}"
+          cd "$DOTNET_ROOT"
+          dotnet format --verify-no-changes --report "$GITHUB_WORKSPACE/dotnet-format-report.json" 2>/dev/null || true
+          if [ -f "$GITHUB_WORKSPACE/dotnet-format-report.json" ] && [ -s "$GITHUB_WORKSPACE/dotnet-format-report.json" ]; then
+            jq -r '.[]? | "\(.FilePath):\(.FileChanges[]? | "\(.LineNumber): \(.DiagnosticId) - \(.FormatDescription)")"' \
+              "$GITHUB_WORKSPACE/dotnet-format-report.json" > "$GITHUB_WORKSPACE/dotnet-format-report.txt" 2>/dev/null || true
+          fi
+          [ ! -f "$GITHUB_WORKSPACE/dotnet-format-report.txt" ] && echo "" > "$GITHUB_WORKSPACE/dotnet-format-report.txt"
+        continue-on-error: true
+
+      - name: Semgrep - C# SAST
+        run: |
+          pip install semgrep
+          DOTNET_ROOT="${{ needs.detect-stack.outputs.dotnet_root }}"
+          cd "$DOTNET_ROOT"
+          semgrep scan --config auto --config p/csharp --config p/security-audit \
+            --text --output "$GITHUB_WORKSPACE/semgrep-dotnet-report.txt" . || true
+        continue-on-error: true
+
+      - name: Upload .NET reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-reports
+          path: |
+            semgrep-dotnet-report.txt
+            dotnet-format-report.txt
+
   codeql-scan:
     name: CodeQL Deep Analysis
     runs-on: ubuntu-latest
@@ -400,16 +523,21 @@ jobs:
             condition: has_node
           - language: go
             condition: has_go
+          - language: java-kotlin
+            condition: has_java
+          - language: csharp
+            condition: has_dotnet
     steps:
       - name: Check if language is detected
         id: check
         run: |
-          LANG="${{ matrix.language }}"
           COND="${{ matrix.condition }}"
           case "$COND" in
             has_python) DETECTED="${{ needs.detect-stack.outputs.has_python }}" ;;
             has_node) DETECTED="${{ needs.detect-stack.outputs.has_node }}" ;;
             has_go) DETECTED="${{ needs.detect-stack.outputs.has_go }}" ;;
+            has_java) DETECTED="${{ needs.detect-stack.outputs.has_java }}" ;;
+            has_dotnet) DETECTED="${{ needs.detect-stack.outputs.has_dotnet }}" ;;
             *) DETECTED="false" ;;
           esac
           echo "should_run=$DETECTED" >> "$GITHUB_OUTPUT"
@@ -438,7 +566,7 @@ jobs:
   send-report:
     name: Generate & Send Report
     runs-on: ubuntu-latest
-    needs: [detect-stack, universal-scan, python-scan, node-scan, go-scan, codeql-scan]
+    needs: [detect-stack, universal-scan, python-scan, node-scan, go-scan, java-scan, dotnet-scan, codeql-scan]
     if: always()
     steps:
       - name: Download all reports
@@ -452,6 +580,8 @@ jobs:
           HAS_PYTHON: ${{ needs.detect-stack.outputs.has_python }}
           HAS_NODE: ${{ needs.detect-stack.outputs.has_node }}
           HAS_GO: ${{ needs.detect-stack.outputs.has_go }}
+          HAS_JAVA: ${{ needs.detect-stack.outputs.has_java }}
+          HAS_DOTNET: ${{ needs.detect-stack.outputs.has_dotnet }}
           HAS_DOCKER: ${{ needs.detect-stack.outputs.has_docker }}
         run: |
           cat > full-report.html << 'HTMLSTART'
@@ -645,6 +775,28 @@ jobs:
               "reports/go-reports/semgrep-go-report.txt"
           fi
 
+          # Java sections (only if detected)
+          if [ "$HAS_JAVA" = "true" ]; then
+            add_section_pre "Java 安全分析 (Semgrep)" \
+              "检测 SQL 注入、反序列化、SSRF、路径遍历等 Java 安全漏洞。" \
+              "reports/java-reports/semgrep-java-report.txt"
+
+            add_section_pre "Java 缺陷检测 (SpotBugs)" \
+              "字节码级别静态分析，检测空指针、资源泄露、并发问题等。" \
+              "reports/java-reports/spotbugs-report.txt"
+          fi
+
+          # .NET sections (only if detected)
+          if [ "$HAS_DOTNET" = "true" ]; then
+            add_section_pre "C# 安全分析 (Semgrep)" \
+              "检测 SQL 注入、XSS、不安全反序列化、密码硬编码等 .NET 安全漏洞。" \
+              "reports/dotnet-reports/semgrep-dotnet-report.txt"
+
+            add_section_pre "C# 代码规范 (dotnet format)" \
+              ".NET 代码风格和格式检查。" \
+              "reports/dotnet-reports/dotnet-format-report.txt"
+          fi
+
           # CodeQL section (results live in GitHub Security tab)
           CODEQL_NUM=$(( $(cat /tmp/sec_counter) + 1 ))
           echo "$CODEQL_NUM" > /tmp/sec_counter
@@ -710,6 +862,8 @@ jobs:
           [ "${{ needs.detect-stack.outputs.has_python }}" = "true" ] && STACK_INFO="${STACK_INFO}Python "
           [ "${{ needs.detect-stack.outputs.has_node }}" = "true" ] && STACK_INFO="${STACK_INFO}Node.js "
           [ "${{ needs.detect-stack.outputs.has_go }}" = "true" ] && STACK_INFO="${STACK_INFO}Go "
+          [ "${{ needs.detect-stack.outputs.has_java }}" = "true" ] && STACK_INFO="${STACK_INFO}Java "
+          [ "${{ needs.detect-stack.outputs.has_dotnet }}" = "true" ] && STACK_INFO="${STACK_INFO}.NET/C# "
           [ "${{ needs.detect-stack.outputs.has_docker }}" = "true" ] && STACK_INFO="${STACK_INFO}Docker "
           [ -z "$STACK_INFO" ] && STACK_INFO="(未检测到特定语言)"
 
