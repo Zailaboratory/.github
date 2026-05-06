@@ -132,21 +132,25 @@ jobs:
           JAVA_ROOT="."
           if [ -f pom.xml ] || [ -f build.gradle ] || [ -f build.gradle.kts ]; then
             HAS_JAVA=true
-          elif find . -maxdepth 2 -name "pom.xml" -o -name "build.gradle" | grep -q .; then
-            HAS_JAVA=true
-            JAVA_ROOT=$(dirname "$(find . -maxdepth 2 \( -name "pom.xml" -o -name "build.gradle" \) -print -quit)")
+          else
+            JAVA_FILE=$(find . -maxdepth 2 \( -name "pom.xml" -o -name "build.gradle" -o -name "build.gradle.kts" \) -print -quit 2>/dev/null)
+            if [ -n "$JAVA_FILE" ]; then
+              HAS_JAVA=true
+              JAVA_ROOT=$(dirname "$JAVA_FILE")
+            fi
           fi
 
           # .NET/C# detection
           HAS_DOTNET=false
           DOTNET_ROOT="."
-          if find . -maxdepth 3 -name "*.csproj" -o -name "*.sln" -o -name "*.fsproj" | grep -q .; then
+          DOTNET_FILE=$(find . -maxdepth 3 \( -name "*.csproj" -o -name "*.sln" -o -name "*.fsproj" \) -print -quit 2>/dev/null)
+          if [ -n "$DOTNET_FILE" ]; then
             HAS_DOTNET=true
-            SLN_FILE=$(find . -maxdepth 2 -name "*.sln" -print -quit)
+            SLN_FILE=$(find . -maxdepth 2 -name "*.sln" -print -quit 2>/dev/null)
             if [ -n "$SLN_FILE" ]; then
               DOTNET_ROOT=$(dirname "$SLN_FILE")
             else
-              CSPROJ_FILE=$(find . -maxdepth 3 -name "*.csproj" -print -quit)
+              CSPROJ_FILE=$(find . -maxdepth 3 -name "*.csproj" -print -quit 2>/dev/null)
               [ -n "$CSPROJ_FILE" ] && DOTNET_ROOT=$(dirname "$CSPROJ_FILE")
             fi
           fi
