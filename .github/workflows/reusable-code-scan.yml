@@ -28,6 +28,16 @@ on:
         type: boolean
         required: false
         default: false
+      skip_java:
+        description: "Skip Java scanning even if detected"
+        type: boolean
+        required: false
+        default: false
+      skip_dotnet:
+        description: "Skip .NET/C# scanning even if detected"
+        type: boolean
+        required: false
+        default: false
       extra_semgrep_rules:
         description: "Additional Semgrep rule configs (space-separated)"
         type: string
@@ -61,6 +71,7 @@ jobs:
       has_java: ${{ steps.detect.outputs.has_java }}
       has_dotnet: ${{ steps.detect.outputs.has_dotnet }}
       has_rust: ${{ steps.detect.outputs.has_rust }}
+      has_ruby: ${{ steps.detect.outputs.has_ruby }}
       has_docker: ${{ steps.detect.outputs.has_docker }}
       python_root: ${{ steps.detect.outputs.python_root }}
       node_root: ${{ steps.detect.outputs.node_root }}
@@ -146,9 +157,15 @@ jobs:
             HAS_RUST=true
           fi
 
+          # Ruby detection
+          HAS_RUBY=false
+          if [ -f Gemfile ] || [ -f config/application.rb ]; then
+            HAS_RUBY=true
+          fi
+
           # Docker/IaC detection
           HAS_DOCKER=false
-          if find . -maxdepth 3 -name "Dockerfile" -o -name "docker-compose.yml" -o -name "docker-compose.yaml" | grep -q .; then
+          if find . -maxdepth 3 \( -name "Dockerfile" -o -name "docker-compose.yml" -o -name "docker-compose.yaml" \) -print -quit | grep -q .; then
             HAS_DOCKER=true
           fi
 
@@ -158,6 +175,7 @@ jobs:
           echo "has_java=$HAS_JAVA" >> "$GITHUB_OUTPUT"
           echo "has_dotnet=$HAS_DOTNET" >> "$GITHUB_OUTPUT"
           echo "has_rust=$HAS_RUST" >> "$GITHUB_OUTPUT"
+          echo "has_ruby=$HAS_RUBY" >> "$GITHUB_OUTPUT"
           echo "has_docker=$HAS_DOCKER" >> "$GITHUB_OUTPUT"
           echo "python_root=$PYTHON_ROOT" >> "$GITHUB_OUTPUT"
           echo "node_root=$NODE_ROOT" >> "$GITHUB_OUTPUT"
@@ -172,6 +190,7 @@ jobs:
           echo "Java: $HAS_JAVA (root: $JAVA_ROOT)"
           echo ".NET/C#: $HAS_DOTNET (root: $DOTNET_ROOT)"
           echo "Rust: $HAS_RUST"
+          echo "Ruby: $HAS_RUBY"
           echo "Docker: $HAS_DOCKER"
 
   universal-scan:
@@ -181,23 +200,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install Gitleaks CLI
-        run: |
-          GITLEAKS_VERSION="8.24.3"
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
-            | tar -xz -C /usr/local/bin gitleaks
-
-      - name: Gitleaks - Secret detection
-        run: |
-          gitleaks detect --source . --report-path gitleaks-report.json --report-format json --exit-code 0 2>&1 | tee gitleaks-output.txt
-          if [ -s gitleaks-report.json ] && [ "$(jq length gitleaks-report.json)" -gt 0 ]; then
-            echo "FOUND" > gitleaks-report.txt
-            echo "" >> gitleaks-report.txt
-            jq -r '.[] | "File: \(.File):\(.StartLine)\nRule: \(.RuleID)\nMatch: \(.Match)\n---"' gitleaks-report.json >> gitleaks-report.txt
-          else
-            echo "CLEAN" > gitleaks-report.txt
-          fi
 
       - name: Set up Python (for pip freeze if needed)
         if: needs.detect-stack.outputs.has_python == 'true' && inputs.skip_python == false
@@ -222,6 +224,7 @@ jobs:
           format: 'json'
           output: 'trivy-vuln-report.json'
           severity: ${{ inputs.trivy_severity }}
+          trivyignores: '.trivyignore'
 
       - name: Trivy - Configuration & IaC scan (JSON)
         if: needs.detect-stack.outputs.has_docker == 'true'
@@ -233,6 +236,23 @@ jobs:
           output: 'trivy-config-report.json'
           severity: ${{ inputs.trivy_severity }}
         continue-on-error: true
+
+      - name: Install Gitleaks CLI
+        run: |
+          GITLEAKS_VERSION="8.24.3"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+
+      - name: Gitleaks - Secret detection
+        run: |
+          gitleaks detect --source . --report-path gitleaks-report.json --report-format json --exit-code 0 2>&1 | tee gitleaks-output.txt
+          if [ -s gitleaks-report.json ] && [ "$(jq length gitleaks-report.json)" -gt 0 ]; then
+            echo "FOUND" > gitleaks-report.txt
+            echo "" >> gitleaks-report.txt
+            jq -r '.[] | "File: \(.File):\(.StartLine)\nRule: \(.RuleID)\nMatch: \(.Match)\n---"' gitleaks-report.json >> gitleaks-report.txt
+          else
+            echo "CLEAN" > gitleaks-report.txt
+          fi
 
       - name: Upload universal reports
         uses: actions/upload-artifact@v4
@@ -409,11 +429,42 @@ jobs:
             staticcheck-report.txt
             semgrep-go-report.txt
 
+  rust-scan:
+    name: Rust Scan
+    runs-on: ubuntu-latest
+    needs: detect-stack
+    if: needs.detect-stack.outputs.has_rust == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: cargo clippy
+        run: |
+          cargo clippy --all-targets --message-format=short 2>&1 | tee "$GITHUB_WORKSPACE/clippy-report.txt" || true
+
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit 2>/dev/null
+          cargo audit 2>&1 | tee "$GITHUB_WORKSPACE/cargo-audit-report.txt" || true
+
+      - name: Upload Rust reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-reports
+          path: |
+            clippy-report.txt
+            cargo-audit-report.txt
+
   java-scan:
     name: Java/Kotlin Scan
     runs-on: ubuntu-latest
     needs: detect-stack
-    if: needs.detect-stack.outputs.has_java == 'true'
+    if: needs.detect-stack.outputs.has_java == 'true' && inputs.skip_java == false
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -460,7 +511,7 @@ jobs:
     name: .NET/C# Scan
     runs-on: ubuntu-latest
     needs: detect-stack
-    if: needs.detect-stack.outputs.has_dotnet == 'true'
+    if: needs.detect-stack.outputs.has_dotnet == 'true' && inputs.skip_dotnet == false
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -527,6 +578,8 @@ jobs:
             condition: has_java
           - language: csharp
             condition: has_dotnet
+          - language: ruby
+            condition: has_ruby
     steps:
       - name: Check if language is detected
         id: check
@@ -538,6 +591,7 @@ jobs:
             has_go) DETECTED="${{ needs.detect-stack.outputs.has_go }}" ;;
             has_java) DETECTED="${{ needs.detect-stack.outputs.has_java }}" ;;
             has_dotnet) DETECTED="${{ needs.detect-stack.outputs.has_dotnet }}" ;;
+            has_ruby) DETECTED="${{ needs.detect-stack.outputs.has_ruby }}" ;;
             *) DETECTED="false" ;;
           esac
           echo "should_run=$DETECTED" >> "$GITHUB_OUTPUT"
@@ -566,7 +620,7 @@ jobs:
   send-report:
     name: Generate & Send Report
     runs-on: ubuntu-latest
-    needs: [detect-stack, universal-scan, python-scan, node-scan, go-scan, java-scan, dotnet-scan, codeql-scan]
+    needs: [detect-stack, universal-scan, python-scan, node-scan, go-scan, rust-scan, java-scan, dotnet-scan, codeql-scan]
     if: always()
     steps:
       - name: Download all reports
@@ -582,6 +636,8 @@ jobs:
           HAS_GO: ${{ needs.detect-stack.outputs.has_go }}
           HAS_JAVA: ${{ needs.detect-stack.outputs.has_java }}
           HAS_DOTNET: ${{ needs.detect-stack.outputs.has_dotnet }}
+          HAS_RUST: ${{ needs.detect-stack.outputs.has_rust }}
+          HAS_RUBY: ${{ needs.detect-stack.outputs.has_ruby }}
           HAS_DOCKER: ${{ needs.detect-stack.outputs.has_docker }}
         run: |
           cat > full-report.html << 'HTMLSTART'
@@ -775,6 +831,17 @@ jobs:
               "reports/go-reports/semgrep-go-report.txt"
           fi
 
+          # Rust sections (only if detected)
+          if [ "$HAS_RUST" = "true" ]; then
+            add_section_pre "Rust 代码检查 (Clippy)" \
+              "Rust 官方 linter，检测常见错误、性能问题和惯用写法。" \
+              "reports/rust-reports/clippy-report.txt"
+
+            add_section_pre "Rust 依赖审计 (cargo audit)" \
+              "检查 Cargo 依赖中的已知安全漏洞。" \
+              "reports/rust-reports/cargo-audit-report.txt"
+          fi
+
           # Java sections (only if detected)
           if [ "$HAS_JAVA" = "true" ]; then
             add_section_pre "Java 安全分析 (Semgrep)" \
@@ -864,6 +931,8 @@ jobs:
           [ "${{ needs.detect-stack.outputs.has_go }}" = "true" ] && STACK_INFO="${STACK_INFO}Go "
           [ "${{ needs.detect-stack.outputs.has_java }}" = "true" ] && STACK_INFO="${STACK_INFO}Java "
           [ "${{ needs.detect-stack.outputs.has_dotnet }}" = "true" ] && STACK_INFO="${STACK_INFO}.NET/C# "
+          [ "${{ needs.detect-stack.outputs.has_rust }}" = "true" ] && STACK_INFO="${STACK_INFO}Rust "
+          [ "${{ needs.detect-stack.outputs.has_ruby }}" = "true" ] && STACK_INFO="${STACK_INFO}Ruby "
           [ "${{ needs.detect-stack.outputs.has_docker }}" = "true" ] && STACK_INFO="${STACK_INFO}Docker "
           [ -z "$STACK_INFO" ] && STACK_INFO="(未检测到特定语言)"
 
