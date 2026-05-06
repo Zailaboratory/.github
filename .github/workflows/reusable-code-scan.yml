@@ -384,10 +384,61 @@ jobs:
             staticcheck-report.txt
             semgrep-go-report.txt
 
+  codeql-scan:
+    name: CodeQL Deep Analysis
+    runs-on: ubuntu-latest
+    needs: detect-stack
+    permissions:
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: python
+            condition: has_python
+          - language: javascript-typescript
+            condition: has_node
+          - language: go
+            condition: has_go
+    steps:
+      - name: Check if language is detected
+        id: check
+        run: |
+          LANG="${{ matrix.language }}"
+          COND="${{ matrix.condition }}"
+          case "$COND" in
+            has_python) DETECTED="${{ needs.detect-stack.outputs.has_python }}" ;;
+            has_node) DETECTED="${{ needs.detect-stack.outputs.has_node }}" ;;
+            has_go) DETECTED="${{ needs.detect-stack.outputs.has_go }}" ;;
+            *) DETECTED="false" ;;
+          esac
+          echo "should_run=$DETECTED" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        if: steps.check.outputs.should_run == 'true'
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        if: steps.check.outputs.should_run == 'true'
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-and-quality
+
+      - name: Autobuild
+        if: steps.check.outputs.should_run == 'true'
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        if: steps.check.outputs.should_run == 'true'
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: '/language:${{ matrix.language }}'
+
   send-report:
     name: Generate & Send Report
     runs-on: ubuntu-latest
-    needs: [detect-stack, universal-scan, python-scan, node-scan, go-scan]
+    needs: [detect-stack, universal-scan, python-scan, node-scan, go-scan, codeql-scan]
     if: always()
     steps:
       - name: Download all reports
@@ -432,14 +483,14 @@ jobs:
           <p class="meta">仓库: ${{ github.repository }} | 分支: ${{ github.ref_name }} | 时间: $(date -u '+%Y-%m-%d %H:%M UTC') | Commit: ${{ github.sha }}</p>
           EOF
 
-          # --- Section counter ---
-          SEC_NUM=0
-          next_sec() { SEC_NUM=$((SEC_NUM + 1)); echo "$SEC_NUM"; }
+          # --- Section counter (file-based to avoid subshell issue) ---
+          echo "0" > /tmp/sec_counter
 
           # --- Helper: add section with raw pre content ---
           add_section_pre() {
             local title="$1" desc="$2" file="$3"
-            local num=$(next_sec)
+            local num=$(( $(cat /tmp/sec_counter) + 1 ))
+            echo "$num" > /tmp/sec_counter
             echo "<div class=\"section\"><h2>${num}. ${title}</h2><p>${desc}</p>" >> full-report.html
             if [ -f "$file" ] && [ -s "$file" ]; then
               echo "<pre>" >> full-report.html
@@ -453,7 +504,8 @@ jobs:
 
           # --- Trivy dependency scan → HTML table from JSON ---
           add_trivy_vuln_section() {
-            local num=$(next_sec)
+            local num=$(( $(cat /tmp/sec_counter) + 1 ))
+            echo "$num" > /tmp/sec_counter
             echo "<div class=\"section\"><h2>${num}. 依赖漏洞扫描 (Trivy)</h2>" >> full-report.html
             echo "<p>检测所有依赖声明文件（pip/npm/go.mod 等）中引用的已知 CVE 漏洞。</p>" >> full-report.html
 
@@ -508,7 +560,8 @@ jobs:
 
           # --- Trivy config scan → HTML table from JSON ---
           add_trivy_config_section() {
-            local num=$(next_sec)
+            local num=$(( $(cat /tmp/sec_counter) + 1 ))
+            echo "$num" > /tmp/sec_counter
             local file="reports/universal-reports/trivy-config-report.json"
             echo "<div class=\"section\"><h2>${num}. 配置安全扫描 (Trivy Config)</h2>" >> full-report.html
             echo "<p>扫描 Dockerfile、docker-compose、Kubernetes 等 IaC 配置的安全问题。</p>" >> full-report.html
@@ -591,6 +644,21 @@ jobs:
               "Go 代码深度安全扫描。" \
               "reports/go-reports/semgrep-go-report.txt"
           fi
+
+          # CodeQL section (results live in GitHub Security tab)
+          CODEQL_NUM=$(( $(cat /tmp/sec_counter) + 1 ))
+          echo "$CODEQL_NUM" > /tmp/sec_counter
+          cat >> full-report.html << EOF
+          <div class="section">
+          <h2>${CODEQL_NUM}. CodeQL 深度语义分析</h2>
+          <p>GitHub 官方 SAST 引擎，支持跨函数数据流追踪，检测注入、认证绕过、敏感数据泄露等深层漏洞。</p>
+          <div style="padding:16px;background:#f0f9ff;border-radius:8px;margin-top:12px;">
+          <p style="margin:0 0 8px;font-weight:600;color:#1e40af;">📊 CodeQL 结果集成在 GitHub Security 面板中</p>
+          <p style="margin:0;font-size:12px;color:#475569;">CodeQL 分析结果不包含在此邮件附件中，请直接在 GitHub 仓库的 <strong>Security → Code scanning alerts</strong> 中查看：</p>
+          <p style="margin:8px 0 0;"><a href="https://github.com/${{ github.repository }}/security/code-scanning" style="color:#3b82f6;font-size:13px;">→ 查看 CodeQL 扫描结果</a></p>
+          </div>
+          </div>
+          EOF
 
           cat >> full-report.html << EOF
           <div style="margin-top:32px;padding:16px;text-align:center;color:#94a3b8;font-size:11px;border-top:1px solid #e2e8f0;">
