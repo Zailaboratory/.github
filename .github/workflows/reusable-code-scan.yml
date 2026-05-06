@@ -397,6 +397,11 @@ jobs:
         continue-on-error: true
 
       - name: Generate full HTML report
+        env:
+          HAS_PYTHON: ${{ needs.detect-stack.outputs.has_python }}
+          HAS_NODE: ${{ needs.detect-stack.outputs.has_node }}
+          HAS_GO: ${{ needs.detect-stack.outputs.has_go }}
+          HAS_DOCKER: ${{ needs.detect-stack.outputs.has_docker }}
         run: |
           cat > full-report.html << 'HTMLSTART'
           <!DOCTYPE html><html><head><meta charset="utf-8">
@@ -408,9 +413,17 @@ jobs:
             h3{font-size:14px;color:#475569;margin:20px 0 8px;}
             .meta{color:#64748b;font-size:12px;margin-bottom:20px;}
             .section{background:#fff;border-radius:8px;padding:20px 24px;margin-bottom:16px;box-shadow:0 1px 2px rgba(0,0,0,.05);}
+            .vuln-table{width:100%;border-collapse:collapse;font-size:12px;margin:12px 0;}
+            .vuln-table th{background:#f1f5f9;padding:8px 10px;text-align:left;font-weight:600;border-bottom:2px solid #e2e8f0;}
+            .vuln-table td{padding:8px 10px;border-bottom:1px solid #f1f5f9;vertical-align:top;}
+            .vuln-table tr:hover td{background:#f8fafc;}
+            .severity-critical{color:#dc2626;font-weight:700;} .severity-high{color:#ea580c;font-weight:600;}
+            .severity-medium{color:#d97706;} .severity-low{color:#65a30d;}
+            .subsection{margin:20px 0 8px;padding:10px 14px;background:#f8fafc;border-left:3px solid #3b82f6;border-radius:0 6px 6px 0;}
+            .subsection-title{font-size:13px;font-weight:600;color:#1e40af;margin:0;}
+            .subsection-meta{font-size:11px;color:#64748b;margin:4px 0 0;}
             pre{background:#f1f5f9;padding:14px;border-radius:6px;font-size:11px;line-height:1.6;overflow-x:auto;white-space:pre-wrap;word-break:break-word;border:1px solid #e2e8f0;}
             .pass{color:#16a34a;} .warn{color:#d97706;} .fail{color:#dc2626;}
-            .skipped{color:#9ca3af;font-style:italic;}
           </style></head><body><div class="container">
           HTMLSTART
 
@@ -419,65 +432,186 @@ jobs:
           <p class="meta">仓库: ${{ github.repository }} | 分支: ${{ github.ref_name }} | 时间: $(date -u '+%Y-%m-%d %H:%M UTC') | Commit: ${{ github.sha }}</p>
           EOF
 
-          # Helper to add a section
-          add_section() {
+          # --- Section counter ---
+          SEC_NUM=0
+          next_sec() { SEC_NUM=$((SEC_NUM + 1)); echo "$SEC_NUM"; }
+
+          # --- Helper: add section with raw pre content ---
+          add_section_pre() {
             local title="$1" desc="$2" file="$3"
-            echo "<div class=\"section\"><h2>$title</h2><p>$desc</p><h3>扫描结果</h3><pre>" >> full-report.html
+            local num=$(next_sec)
+            echo "<div class=\"section\"><h2>${num}. ${title}</h2><p>${desc}</p>" >> full-report.html
             if [ -f "$file" ] && [ -s "$file" ]; then
+              echo "<pre>" >> full-report.html
               sed 's/</\&lt;/g; s/>/\&gt;/g' "$file" >> full-report.html
+              echo "</pre>" >> full-report.html
             else
-              echo "<span class=\"skipped\">未执行（项目未检测到相关技术栈，或扫描工具未产生输出）</span>" >> full-report.html
+              echo "<p style=\"color:#9ca3af;font-style:italic;\">扫描工具未产生输出。</p>" >> full-report.html
             fi
-            echo "</pre></div>" >> full-report.html
+            echo "</div>" >> full-report.html
           }
 
-          add_section "1. 依赖漏洞扫描 (Trivy)" \
-            "检测所有依赖声明文件中引用的已知 CVE 漏洞。" \
-            "reports/universal-reports/trivy-vuln-report.txt"
+          # --- Trivy dependency scan → HTML table ---
+          add_trivy_vuln_section() {
+            local num=$(next_sec)
+            echo "<div class=\"section\"><h2>${num}. 依赖漏洞扫描 (Trivy)</h2>" >> full-report.html
+            echo "<p>检测所有依赖声明文件（pip/npm/go.mod 等）中引用的已知 CVE 漏洞。</p>" >> full-report.html
 
-          add_section "2. 配置安全扫描 (Trivy Config)" \
-            "扫描 Dockerfile、docker-compose 等 IaC 配置的安全问题。" \
-            "reports/universal-reports/trivy-config-report.txt"
+            local file="reports/universal-reports/trivy-vuln-report.txt"
+            if [ ! -f "$file" ] || [ ! -s "$file" ]; then
+              echo "<p style=\"color:#9ca3af;font-style:italic;\">Trivy 未产生输出。</p></div>" >> full-report.html
+              return
+            fi
 
-          add_section "3. 密钥泄露检测 (Gitleaks)" \
+            # Parse each target block
+            local current_target="" current_total=""
+            local in_table=false
+            while IFS= read -r line; do
+              # Detect target header like "backend/requirements.txt (pip)"
+              if echo "$line" | grep -qP '^\S.*\((pip|npm|gomod|cargo|composer|gem|nuget)\)'; then
+                if [ "$in_table" = true ]; then
+                  echo "</tbody></table>" >> full-report.html
+                fi
+                current_target=$(echo "$line" | sed 's/=*$//')
+                in_table=false
+                echo "<div class=\"subsection\"><p class=\"subsection-title\">📦 ${current_target}</p>" >> full-report.html
+              elif echo "$line" | grep -qP '^Total:'; then
+                current_total="$line"
+                echo "<p class=\"subsection-meta\">${current_total}</p></div>" >> full-report.html
+              elif echo "$line" | grep -qP '^\│.*\│.*\│'; then
+                # Table row - parse cells
+                if [ "$in_table" = false ]; then
+                  echo "<table class=\"vuln-table\"><thead><tr><th>Library</th><th>CVE</th><th>Severity</th><th>Installed</th><th>Fixed</th><th>Description</th></tr></thead><tbody>" >> full-report.html
+                  in_table=true
+                fi
+                # Extract cells from table row (│ col1 │ col2 │ ...)
+                local cells=$(echo "$line" | sed 's/^│//;s/│$//' | sed 's/│/\t/g')
+                local lib=$(echo "$cells" | cut -f1 | xargs)
+                local cve=$(echo "$cells" | cut -f2 | xargs)
+                local sev=$(echo "$cells" | cut -f3 | xargs)
+                local status=$(echo "$cells" | cut -f4 | xargs)
+                local installed=$(echo "$cells" | cut -f5 | xargs)
+                local fixed=$(echo "$cells" | cut -f6 | xargs)
+                local title_field=$(echo "$cells" | cut -f7 | xargs)
+
+                # Skip header rows and separator rows
+                if [ "$lib" = "Library" ] || echo "$lib" | grep -qP '^─'; then
+                  continue
+                fi
+                # Skip empty rows
+                if [ -z "$lib" ] && [ -z "$cve" ]; then
+                  continue
+                fi
+
+                local sev_class="severity-medium"
+                case "$sev" in
+                  CRITICAL) sev_class="severity-critical" ;;
+                  HIGH) sev_class="severity-high" ;;
+                  MEDIUM) sev_class="severity-medium" ;;
+                  LOW) sev_class="severity-low" ;;
+                esac
+
+                echo "<tr><td>${lib}</td><td><a href=\"https://avd.aquasec.com/nvd/${cve}\">${cve}</a></td><td class=\"${sev_class}\">${sev}</td><td>${installed}</td><td>${fixed}</td><td>${title_field}</td></tr>" >> full-report.html
+              fi
+            done < "$file"
+
+            if [ "$in_table" = true ]; then
+              echo "</tbody></table>" >> full-report.html
+            fi
+            echo "</div>" >> full-report.html
+          }
+
+          # --- Trivy config scan → HTML table ---
+          add_trivy_config_section() {
+            local num=$(next_sec)
+            local file="reports/universal-reports/trivy-config-report.txt"
+            echo "<div class=\"section\"><h2>${num}. 配置安全扫描 (Trivy Config)</h2>" >> full-report.html
+            echo "<p>扫描 Dockerfile、docker-compose、Kubernetes 等 IaC 配置的安全问题。</p>" >> full-report.html
+
+            if [ ! -f "$file" ] || [ ! -s "$file" ]; then
+              echo "<p style=\"color:#9ca3af;font-style:italic;\">未检测到配置文件或无安全问题。</p></div>" >> full-report.html
+              return
+            fi
+
+            echo "<table class=\"vuln-table\"><thead><tr><th>文件</th><th>规则 ID</th><th>Severity</th><th>说明</th></tr></thead><tbody>" >> full-report.html
+
+            local current_file=""
+            while IFS= read -r line; do
+              if echo "$line" | grep -qP '^\S.*\((dockerfile|kubernetes|terraform|cloudformation)\)'; then
+                current_file=$(echo "$line" | sed 's/ (.*//;s/=*$//')
+              elif echo "$line" | grep -qP '^\w+-\d+ \((HIGH|CRITICAL|MEDIUM|LOW)\):'; then
+                local rule_id=$(echo "$line" | grep -oP '^\S+')
+                local severity=$(echo "$line" | grep -oP '\((\w+)\)' | tr -d '()')
+                local desc=$(echo "$line" | sed 's/^[^ ]* ([^)]*): //')
+                local sev_class="severity-medium"
+                case "$severity" in
+                  CRITICAL) sev_class="severity-critical" ;;
+                  HIGH) sev_class="severity-high" ;;
+                  MEDIUM) sev_class="severity-medium" ;;
+                esac
+                echo "<tr><td>${current_file}</td><td>${rule_id}</td><td class=\"${sev_class}\">${severity}</td><td>${desc}</td></tr>" >> full-report.html
+              fi
+            done < "$file"
+
+            echo "</tbody></table></div>" >> full-report.html
+          }
+
+          # === Build Report ===
+          add_trivy_vuln_section
+
+          # Config scan only if Docker detected
+          if [ "$HAS_DOCKER" = "true" ]; then
+            add_trivy_config_section
+          fi
+
+          add_section_pre "密钥泄露检测 (Gitleaks)" \
             "扫描代码中是否误提交了密码、API Key、Token 等敏感信息。" \
             "reports/universal-reports/gitleaks-report.txt"
 
-          add_section "4. Python 深度安全分析 (Semgrep)" \
-            "语义分析引擎检测 SQL 注入、命令注入、SSRF、XXE 等安全漏洞。" \
-            "reports/python-reports/semgrep-python-report.txt"
+          # Python sections (only if detected)
+          if [ "$HAS_PYTHON" = "true" ]; then
+            add_section_pre "Python 深度安全分析 (Semgrep)" \
+              "语义分析引擎检测 SQL 注入、命令注入、SSRF、XXE 等安全漏洞。" \
+              "reports/python-reports/semgrep-python-report.txt"
 
-          add_section "5. Python 安全模式检测 (Bandit)" \
-            "AST 模式匹配检测常见安全反模式（中等置信度及以上）。" \
-            "reports/python-reports/bandit-report.txt"
+            add_section_pre "Python 安全模式检测 (Bandit)" \
+              "AST 模式匹配检测常见安全反模式（中等置信度及以上）。" \
+              "reports/python-reports/bandit-report.txt"
 
-          add_section "6. Python 代码规范 (Ruff)" \
-            "代码风格、未使用变量、潜在运行时错误检查。" \
-            "reports/python-reports/ruff-report.txt"
+            add_section_pre "Python 代码规范 (Ruff)" \
+              "代码风格、未使用变量、潜在运行时错误检查。" \
+              "reports/python-reports/ruff-report.txt"
+          fi
 
-          add_section "7. TypeScript 类型检查" \
-            "前端代码类型安全验证。" \
-            "reports/node-reports/tsc-report.txt"
+          # Node.js sections (only if detected)
+          if [ "$HAS_NODE" = "true" ]; then
+            add_section_pre "TypeScript 类型检查" \
+              "前端代码类型安全验证。" \
+              "reports/node-reports/tsc-report.txt"
 
-          add_section "8. 前端安全分析 (Semgrep)" \
-            "检测 React/TypeScript 代码中的 XSS、不安全 URL 处理等问题。" \
-            "reports/node-reports/semgrep-frontend-report.txt"
+            add_section_pre "前端安全分析 (Semgrep)" \
+              "检测 React/TypeScript 代码中的 XSS、不安全 URL 处理等问题。" \
+              "reports/node-reports/semgrep-frontend-report.txt"
 
-          add_section "9. 前端依赖审计 (npm audit)" \
-            "前端 npm 包已知漏洞检查。" \
-            "reports/node-reports/npm-audit-report.txt"
+            add_section_pre "前端依赖审计 (npm audit)" \
+              "前端 npm 包已知漏洞检查。" \
+              "reports/node-reports/npm-audit-report.txt"
+          fi
 
-          add_section "10. Go 静态分析 (go vet)" \
-            "Go 代码静态检查。" \
-            "reports/go-reports/go-vet-report.txt"
+          # Go sections (only if detected)
+          if [ "$HAS_GO" = "true" ]; then
+            add_section_pre "Go 静态分析 (go vet)" \
+              "Go 代码静态检查。" \
+              "reports/go-reports/go-vet-report.txt"
 
-          add_section "11. Go 高级检查 (staticcheck)" \
-            "Go 代码高级静态分析。" \
-            "reports/go-reports/staticcheck-report.txt"
+            add_section_pre "Go 高级检查 (staticcheck)" \
+              "Go 代码高级静态分析。" \
+              "reports/go-reports/staticcheck-report.txt"
 
-          add_section "12. Go 安全分析 (Semgrep)" \
-            "Go 代码深度安全扫描。" \
-            "reports/go-reports/semgrep-go-report.txt"
+            add_section_pre "Go 安全分析 (Semgrep)" \
+              "Go 代码深度安全扫描。" \
+              "reports/go-reports/semgrep-go-report.txt"
+          fi
 
           cat >> full-report.html << EOF
           <div style="margin-top:32px;padding:16px;text-align:center;color:#94a3b8;font-size:11px;border-top:1px solid #e2e8f0;">
