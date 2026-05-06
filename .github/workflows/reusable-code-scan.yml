@@ -1,0 +1,654 @@
+name: Reusable Code Scan
+
+on:
+  workflow_call:
+    inputs:
+      notify_email:
+        description: "Override recipient email (semicolon-separated). Falls back to org secret NOTIFY_EMAIL."
+        type: string
+        required: false
+        default: ''
+      trivy_severity:
+        description: "Trivy severity threshold"
+        type: string
+        required: false
+        default: 'CRITICAL,HIGH,MEDIUM'
+      skip_python:
+        description: "Skip Python scanning even if detected"
+        type: boolean
+        required: false
+        default: false
+      skip_node:
+        description: "Skip Node.js/TypeScript scanning even if detected"
+        type: boolean
+        required: false
+        default: false
+      skip_go:
+        description: "Skip Go scanning even if detected"
+        type: boolean
+        required: false
+        default: false
+      extra_semgrep_rules:
+        description: "Additional Semgrep rule configs (space-separated)"
+        type: string
+        required: false
+        default: ''
+    secrets:
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_CLIENT_SECRET:
+        required: true
+      MAIL_SENDER:
+        required: true
+      NOTIFY_EMAIL:
+        required: true
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  detect-stack:
+    name: Detect Tech Stack
+    runs-on: ubuntu-latest
+    outputs:
+      has_python: ${{ steps.detect.outputs.has_python }}
+      has_node: ${{ steps.detect.outputs.has_node }}
+      has_go: ${{ steps.detect.outputs.has_go }}
+      has_java: ${{ steps.detect.outputs.has_java }}
+      has_rust: ${{ steps.detect.outputs.has_rust }}
+      has_docker: ${{ steps.detect.outputs.has_docker }}
+      python_root: ${{ steps.detect.outputs.python_root }}
+      node_root: ${{ steps.detect.outputs.node_root }}
+      go_root: ${{ steps.detect.outputs.go_root }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect languages and frameworks
+        id: detect
+        run: |
+          # Python detection
+          HAS_PYTHON=false
+          PYTHON_ROOT="."
+          if [ -f pyproject.toml ] || [ -f requirements.txt ] || [ -f Pipfile ] || [ -f setup.py ]; then
+            HAS_PYTHON=true
+          elif [ -f backend/pyproject.toml ] || [ -f backend/requirements.txt ]; then
+            HAS_PYTHON=true
+            PYTHON_ROOT="backend"
+          elif [ -f server/pyproject.toml ] || [ -f server/requirements.txt ]; then
+            HAS_PYTHON=true
+            PYTHON_ROOT="server"
+          elif [ -f api/pyproject.toml ] || [ -f api/requirements.txt ]; then
+            HAS_PYTHON=true
+            PYTHON_ROOT="api"
+          fi
+
+          # Node.js detection
+          HAS_NODE=false
+          NODE_ROOT="."
+          if [ -f package.json ]; then
+            HAS_NODE=true
+          elif [ -f frontend/package.json ]; then
+            HAS_NODE=true
+            NODE_ROOT="frontend"
+          elif [ -f web/package.json ]; then
+            HAS_NODE=true
+            NODE_ROOT="web"
+          elif [ -f client/package.json ]; then
+            HAS_NODE=true
+            NODE_ROOT="client"
+          fi
+
+          # Go detection
+          HAS_GO=false
+          GO_ROOT="."
+          if [ -f go.mod ]; then
+            HAS_GO=true
+          elif [ -f backend/go.mod ]; then
+            HAS_GO=true
+            GO_ROOT="backend"
+          fi
+
+          # Java detection
+          HAS_JAVA=false
+          if [ -f pom.xml ] || [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+            HAS_JAVA=true
+          fi
+
+          # Rust detection
+          HAS_RUST=false
+          if [ -f Cargo.toml ]; then
+            HAS_RUST=true
+          fi
+
+          # Docker/IaC detection
+          HAS_DOCKER=false
+          if find . -maxdepth 3 -name "Dockerfile" -o -name "docker-compose.yml" -o -name "docker-compose.yaml" | grep -q .; then
+            HAS_DOCKER=true
+          fi
+
+          echo "has_python=$HAS_PYTHON" >> "$GITHUB_OUTPUT"
+          echo "has_node=$HAS_NODE" >> "$GITHUB_OUTPUT"
+          echo "has_go=$HAS_GO" >> "$GITHUB_OUTPUT"
+          echo "has_java=$HAS_JAVA" >> "$GITHUB_OUTPUT"
+          echo "has_rust=$HAS_RUST" >> "$GITHUB_OUTPUT"
+          echo "has_docker=$HAS_DOCKER" >> "$GITHUB_OUTPUT"
+          echo "python_root=$PYTHON_ROOT" >> "$GITHUB_OUTPUT"
+          echo "node_root=$NODE_ROOT" >> "$GITHUB_OUTPUT"
+          echo "go_root=$GO_ROOT" >> "$GITHUB_OUTPUT"
+
+          echo "=== Detection Results ==="
+          echo "Python: $HAS_PYTHON (root: $PYTHON_ROOT)"
+          echo "Node.js: $HAS_NODE (root: $NODE_ROOT)"
+          echo "Go: $HAS_GO (root: $GO_ROOT)"
+          echo "Java: $HAS_JAVA"
+          echo "Rust: $HAS_RUST"
+          echo "Docker: $HAS_DOCKER"
+
+  universal-scan:
+    name: Universal Security Scan
+    runs-on: ubuntu-latest
+    needs: detect-stack
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Gitleaks CLI
+        run: |
+          GITLEAKS_VERSION="8.24.3"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+
+      - name: Gitleaks - Secret detection
+        run: |
+          gitleaks detect --source . --report-path gitleaks-report.json --report-format json --exit-code 0 2>&1 | tee gitleaks-output.txt
+          if [ -s gitleaks-report.json ] && [ "$(jq length gitleaks-report.json)" -gt 0 ]; then
+            echo "FOUND" > gitleaks-report.txt
+            echo "" >> gitleaks-report.txt
+            jq -r '.[] | "File: \(.File):\(.StartLine)\nRule: \(.RuleID)\nMatch: \(.Match)\n---"' gitleaks-report.json >> gitleaks-report.txt
+          else
+            echo "CLEAN" > gitleaks-report.txt
+          fi
+
+      - name: Set up Python (for pip freeze if needed)
+        if: needs.detect-stack.outputs.has_python == 'true' && inputs.skip_python == false
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Generate Python lockfile for Trivy
+        if: needs.detect-stack.outputs.has_python == 'true' && inputs.skip_python == false
+        run: |
+          PYROOT="${{ needs.detect-stack.outputs.python_root }}"
+          cd "$PYROOT"
+          if [ -f pyproject.toml ] && [ ! -f requirements.txt ]; then
+            pip install . -q 2>/dev/null && pip freeze > requirements.txt || true
+          fi
+
+      - name: Trivy - Dependency vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          output: 'trivy-vuln-report.txt'
+          severity: ${{ inputs.trivy_severity }}
+
+      - name: Trivy - Configuration & IaC scan
+        if: needs.detect-stack.outputs.has_docker == 'true'
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          format: 'table'
+          output: 'trivy-config-report.txt'
+          severity: ${{ inputs.trivy_severity }}
+        continue-on-error: true
+
+      - name: Upload universal reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: universal-reports
+          path: |
+            trivy-vuln-report.txt
+            trivy-config-report.txt
+            gitleaks-report.txt
+
+  python-scan:
+    name: Python Scan
+    runs-on: ubuntu-latest
+    needs: detect-stack
+    if: needs.detect-stack.outputs.has_python == 'true' && inputs.skip_python == false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install scan tools
+        run: pip install ruff bandit semgrep
+
+      - name: Ruff - Code quality
+        run: |
+          PYROOT="${{ needs.detect-stack.outputs.python_root }}"
+          cd "$PYROOT"
+          # Find the main source directory
+          if [ -d "app" ]; then SRC="app"
+          elif [ -d "src" ]; then SRC="src"
+          elif [ -d "lib" ]; then SRC="lib"
+          else SRC="."
+          fi
+          ruff check "$SRC" --output-format concise > "$GITHUB_WORKSPACE/ruff-report.txt" 2>&1 || true
+
+      - name: Bandit - Security patterns
+        run: |
+          PYROOT="${{ needs.detect-stack.outputs.python_root }}"
+          cd "$PYROOT"
+          if [ -d "app" ]; then SRC="app"
+          elif [ -d "src" ]; then SRC="src"
+          elif [ -d "lib" ]; then SRC="lib"
+          else SRC="."
+          fi
+          bandit -r "$SRC" -f txt -o "$GITHUB_WORKSPACE/bandit-report.txt" \
+            --severity-level medium --confidence-level medium || true
+
+      - name: Semgrep - Deep SAST
+        run: |
+          PYROOT="${{ needs.detect-stack.outputs.python_root }}"
+          EXTRA_RULES="${{ inputs.extra_semgrep_rules }}"
+          cd "$PYROOT"
+          CONFIGS="--config auto --config p/python --config p/security-audit"
+          if [ -n "$EXTRA_RULES" ]; then
+            for rule in $EXTRA_RULES; do
+              CONFIGS="$CONFIGS --config $rule"
+            done
+          fi
+          semgrep scan $CONFIGS --text --output "$GITHUB_WORKSPACE/semgrep-python-report.txt" . || true
+        continue-on-error: true
+
+      - name: Upload Python reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-reports
+          path: |
+            ruff-report.txt
+            bandit-report.txt
+            semgrep-python-report.txt
+
+  node-scan:
+    name: Node.js / TypeScript Scan
+    runs-on: ubuntu-latest
+    needs: detect-stack
+    if: needs.detect-stack.outputs.has_node == 'true' && inputs.skip_node == false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          NODE_ROOT="${{ needs.detect-stack.outputs.node_root }}"
+          cd "$NODE_ROOT"
+          npm ci 2>/dev/null || npm install 2>/dev/null || true
+
+      - name: TypeScript type check
+        run: |
+          NODE_ROOT="${{ needs.detect-stack.outputs.node_root }}"
+          cd "$NODE_ROOT"
+          if [ -f tsconfig.json ]; then
+            npx tsc --noEmit > "$GITHUB_WORKSPACE/tsc-report.txt" 2>&1 || true
+          else
+            echo "No tsconfig.json found, skipping TypeScript check." > "$GITHUB_WORKSPACE/tsc-report.txt"
+          fi
+
+      - name: npm audit
+        run: |
+          NODE_ROOT="${{ needs.detect-stack.outputs.node_root }}"
+          cd "$NODE_ROOT"
+          npm audit > "$GITHUB_WORKSPACE/npm-audit-report.txt" 2>&1 || true
+
+      - name: Semgrep - Frontend SAST
+        run: |
+          pip install semgrep
+          NODE_ROOT="${{ needs.detect-stack.outputs.node_root }}"
+          cd "$NODE_ROOT"
+          SRC="src"
+          [ ! -d "src" ] && SRC="."
+          semgrep scan --config auto --config p/typescript --config p/react \
+            --text --output "$GITHUB_WORKSPACE/semgrep-frontend-report.txt" \
+            "$SRC" || true
+        continue-on-error: true
+
+      - name: Upload Node.js reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-reports
+          path: |
+            tsc-report.txt
+            npm-audit-report.txt
+            semgrep-frontend-report.txt
+
+  go-scan:
+    name: Go Scan
+    runs-on: ubuntu-latest
+    needs: detect-stack
+    if: needs.detect-stack.outputs.has_go == 'true' && inputs.skip_go == false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Go vet
+        run: |
+          GO_ROOT="${{ needs.detect-stack.outputs.go_root }}"
+          cd "$GO_ROOT"
+          go vet ./... > "$GITHUB_WORKSPACE/go-vet-report.txt" 2>&1 || true
+
+      - name: Install and run staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          GO_ROOT="${{ needs.detect-stack.outputs.go_root }}"
+          cd "$GO_ROOT"
+          staticcheck ./... > "$GITHUB_WORKSPACE/staticcheck-report.txt" 2>&1 || true
+
+      - name: Semgrep - Go SAST
+        run: |
+          pip install semgrep
+          GO_ROOT="${{ needs.detect-stack.outputs.go_root }}"
+          cd "$GO_ROOT"
+          semgrep scan --config auto --config p/golang \
+            --text --output "$GITHUB_WORKSPACE/semgrep-go-report.txt" . || true
+        continue-on-error: true
+
+      - name: Upload Go reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-reports
+          path: |
+            go-vet-report.txt
+            staticcheck-report.txt
+            semgrep-go-report.txt
+
+  send-report:
+    name: Generate & Send Report
+    runs-on: ubuntu-latest
+    needs: [detect-stack, universal-scan, python-scan, node-scan, go-scan]
+    if: always()
+    steps:
+      - name: Download all reports
+        uses: actions/download-artifact@v4
+        with:
+          path: reports
+        continue-on-error: true
+
+      - name: Generate full HTML report
+        run: |
+          cat > full-report.html << 'HTMLSTART'
+          <!DOCTYPE html><html><head><meta charset="utf-8">
+          <style>
+            body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:24px;background:#f8fafc;color:#1e293b;font-size:13px;}
+            .container{max-width:1100px;margin:0 auto;}
+            h1{font-size:22px;color:#0f172a;margin:0 0 8px;}
+            h2{font-size:16px;color:#1e40af;margin:32px 0 12px;padding-bottom:8px;border-bottom:2px solid #e2e8f0;}
+            h3{font-size:14px;color:#475569;margin:20px 0 8px;}
+            .meta{color:#64748b;font-size:12px;margin-bottom:20px;}
+            .section{background:#fff;border-radius:8px;padding:20px 24px;margin-bottom:16px;box-shadow:0 1px 2px rgba(0,0,0,.05);}
+            pre{background:#f1f5f9;padding:14px;border-radius:6px;font-size:11px;line-height:1.6;overflow-x:auto;white-space:pre-wrap;word-break:break-word;border:1px solid #e2e8f0;}
+            .pass{color:#16a34a;} .warn{color:#d97706;} .fail{color:#dc2626;}
+            .skipped{color:#9ca3af;font-style:italic;}
+          </style></head><body><div class="container">
+          HTMLSTART
+
+          cat >> full-report.html << EOF
+          <h1>代码安全扫描完整报告</h1>
+          <p class="meta">仓库: ${{ github.repository }} | 分支: ${{ github.ref_name }} | 时间: $(date -u '+%Y-%m-%d %H:%M UTC') | Commit: ${{ github.sha }}</p>
+          EOF
+
+          # Helper to add a section
+          add_section() {
+            local title="$1" desc="$2" file="$3"
+            echo "<div class=\"section\"><h2>$title</h2><p>$desc</p><h3>扫描结果</h3><pre>" >> full-report.html
+            if [ -f "$file" ] && [ -s "$file" ]; then
+              sed 's/</\&lt;/g; s/>/\&gt;/g' "$file" >> full-report.html
+            else
+              echo "<span class=\"skipped\">未执行（项目未检测到相关技术栈，或扫描工具未产生输出）</span>" >> full-report.html
+            fi
+            echo "</pre></div>" >> full-report.html
+          }
+
+          add_section "1. 依赖漏洞扫描 (Trivy)" \
+            "检测所有依赖声明文件中引用的已知 CVE 漏洞。" \
+            "reports/universal-reports/trivy-vuln-report.txt"
+
+          add_section "2. 配置安全扫描 (Trivy Config)" \
+            "扫描 Dockerfile、docker-compose 等 IaC 配置的安全问题。" \
+            "reports/universal-reports/trivy-config-report.txt"
+
+          add_section "3. 密钥泄露检测 (Gitleaks)" \
+            "扫描代码中是否误提交了密码、API Key、Token 等敏感信息。" \
+            "reports/universal-reports/gitleaks-report.txt"
+
+          add_section "4. Python 深度安全分析 (Semgrep)" \
+            "语义分析引擎检测 SQL 注入、命令注入、SSRF、XXE 等安全漏洞。" \
+            "reports/python-reports/semgrep-python-report.txt"
+
+          add_section "5. Python 安全模式检测 (Bandit)" \
+            "AST 模式匹配检测常见安全反模式（中等置信度及以上）。" \
+            "reports/python-reports/bandit-report.txt"
+
+          add_section "6. Python 代码规范 (Ruff)" \
+            "代码风格、未使用变量、潜在运行时错误检查。" \
+            "reports/python-reports/ruff-report.txt"
+
+          add_section "7. TypeScript 类型检查" \
+            "前端代码类型安全验证。" \
+            "reports/node-reports/tsc-report.txt"
+
+          add_section "8. 前端安全分析 (Semgrep)" \
+            "检测 React/TypeScript 代码中的 XSS、不安全 URL 处理等问题。" \
+            "reports/node-reports/semgrep-frontend-report.txt"
+
+          add_section "9. 前端依赖审计 (npm audit)" \
+            "前端 npm 包已知漏洞检查。" \
+            "reports/node-reports/npm-audit-report.txt"
+
+          add_section "10. Go 静态分析 (go vet)" \
+            "Go 代码静态检查。" \
+            "reports/go-reports/go-vet-report.txt"
+
+          add_section "11. Go 高级检查 (staticcheck)" \
+            "Go 代码高级静态分析。" \
+            "reports/go-reports/staticcheck-report.txt"
+
+          add_section "12. Go 安全分析 (Semgrep)" \
+            "Go 代码深度安全扫描。" \
+            "reports/go-reports/semgrep-go-report.txt"
+
+          cat >> full-report.html << EOF
+          <div style="margin-top:32px;padding:16px;text-align:center;color:#94a3b8;font-size:11px;border-top:1px solid #e2e8f0;">
+          <p>此报告由 GitHub Actions 自动生成 | <a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">查看运行日志</a></p>
+          </div></div></body></html>
+          EOF
+
+      - name: Generate email summary
+        run: |
+          # Quick stats
+          TRIVY_COUNT=0
+          [ -f reports/universal-reports/trivy-vuln-report.txt ] && \
+            TRIVY_COUNT=$(grep -oP 'Total: \K[0-9]+' reports/universal-reports/trivy-vuln-report.txt 2>/dev/null | head -1 || echo "0")
+
+          GITLEAKS_OK=true
+          [ -f reports/universal-reports/gitleaks-report.txt ] && \
+            [ "$(head -1 reports/universal-reports/gitleaks-report.txt)" = "FOUND" ] && GITLEAKS_OK=false
+
+          BANDIT_ISSUES=0
+          [ -f reports/python-reports/bandit-report.txt ] && \
+            BANDIT_ISSUES=$(grep -c ">> Issue:" reports/python-reports/bandit-report.txt 2>/dev/null || echo "0")
+
+          RUFF_COUNT=0
+          [ -f reports/python-reports/ruff-report.txt ] && \
+            RUFF_COUNT=$(grep -oP 'Found \K[0-9]+' reports/python-reports/ruff-report.txt 2>/dev/null || echo "0")
+
+          TSC_COUNT=0
+          [ -f reports/node-reports/tsc-report.txt ] && \
+            TSC_COUNT=$(grep -c "error TS" reports/node-reports/tsc-report.txt 2>/dev/null || echo "0")
+
+          GO_VET_ISSUES=0
+          [ -f reports/go-reports/go-vet-report.txt ] && [ -s reports/go-reports/go-vet-report.txt ] && \
+            GO_VET_ISSUES=$(wc -l < reports/go-reports/go-vet-report.txt)
+
+          # Banner
+          if [ "$GITLEAKS_OK" = false ]; then
+            BANNER="❌ 检测到密钥泄露风险，请立即处理"
+            BANNER_COLOR="#ef4444"
+          elif [ "$TRIVY_COUNT" -gt 0 ] || [ "$BANDIT_ISSUES" -gt 0 ]; then
+            BANNER="⚠️ 发现安全问题，请查看附件详细报告"
+            BANNER_COLOR="#f59e0b"
+          else
+            BANNER="✅ 所有检查项均通过，代码状态良好"
+            BANNER_COLOR="#10b981"
+          fi
+
+          # Detected stack info
+          STACK_INFO=""
+          [ "${{ needs.detect-stack.outputs.has_python }}" = "true" ] && STACK_INFO="${STACK_INFO}Python "
+          [ "${{ needs.detect-stack.outputs.has_node }}" = "true" ] && STACK_INFO="${STACK_INFO}Node.js "
+          [ "${{ needs.detect-stack.outputs.has_go }}" = "true" ] && STACK_INFO="${STACK_INFO}Go "
+          [ "${{ needs.detect-stack.outputs.has_docker }}" = "true" ] && STACK_INFO="${STACK_INFO}Docker "
+          [ -z "$STACK_INFO" ] && STACK_INFO="(未检测到特定语言)"
+
+          cat > email-body.html << EOF
+          <!DOCTYPE html><html><head><meta charset="utf-8"></head>
+          <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:0;background:#f1f5f9;">
+          <div style="max-width:680px;margin:0 auto;padding:24px;">
+          <div style="background:#fff;border-radius:12px;padding:28px 32px;box-shadow:0 1px 3px rgba(0,0,0,.08);">
+
+          <h1 style="font-size:18px;color:#0f172a;margin:0 0 4px;">代码扫描周报</h1>
+          <p style="color:#64748b;font-size:12px;margin:0 0 6px;">$(date -u '+%Y-%m-%d %H:%M UTC') · ${{ github.repository }} · ${{ github.ref_name }}</p>
+          <p style="color:#64748b;font-size:11px;margin:0 0 20px;">检测到技术栈: ${STACK_INFO}</p>
+
+          <div style="background:${BANNER_COLOR}12;border-left:4px solid ${BANNER_COLOR};padding:14px 18px;border-radius:6px;margin-bottom:20px;">
+          <span style="font-size:15px;font-weight:600;color:${BANNER_COLOR};">${BANNER}</span>
+          </div>
+
+          <table style="width:100%;border-collapse:collapse;font-size:13px;">
+          <tr style="border-bottom:1px solid #e2e8f0;"><td style="padding:10px 0;font-weight:500;">依赖漏洞 (Trivy)</td><td style="padding:10px 0;text-align:right;">$([ "$TRIVY_COUNT" -eq 0 ] && echo '✅ 无漏洞' || echo "⚠️ ${TRIVY_COUNT} 个漏洞")</td></tr>
+          <tr style="border-bottom:1px solid #e2e8f0;"><td style="padding:10px 0;font-weight:500;">密钥泄露 (Gitleaks)</td><td style="padding:10px 0;text-align:right;">$([ "$GITLEAKS_OK" = true ] && echo '✅ 未检出' || echo '❌ 发现泄露')</td></tr>
+          EOF
+
+          if [ "${{ needs.detect-stack.outputs.has_python }}" = "true" ]; then
+            cat >> email-body.html << EOF
+          <tr style="border-bottom:1px solid #e2e8f0;"><td style="padding:10px 0;font-weight:500;">Python 安全 (Semgrep+Bandit)</td><td style="padding:10px 0;text-align:right;">$([ "$BANDIT_ISSUES" -eq 0 ] && echo '✅ 未发现' || echo "⚠️ ${BANDIT_ISSUES} 个问题")</td></tr>
+          <tr style="border-bottom:1px solid #e2e8f0;"><td style="padding:10px 0;font-weight:500;">代码规范 (Ruff)</td><td style="padding:10px 0;text-align:right;">$([ "$RUFF_COUNT" -eq 0 ] && echo '✅ 通过' || echo "⚠️ ${RUFF_COUNT} 个问题")</td></tr>
+          EOF
+          fi
+
+          if [ "${{ needs.detect-stack.outputs.has_node }}" = "true" ]; then
+            cat >> email-body.html << EOF
+          <tr style="border-bottom:1px solid #e2e8f0;"><td style="padding:10px 0;font-weight:500;">TypeScript 类型</td><td style="padding:10px 0;text-align:right;">$([ "$TSC_COUNT" -eq 0 ] && echo '✅ 通过' || echo "⚠️ ${TSC_COUNT} 个错误")</td></tr>
+          <tr style="border-bottom:1px solid #e2e8f0;"><td style="padding:10px 0;font-weight:500;">前端安全 (Semgrep)</td><td style="padding:10px 0;text-align:right;">查看附件</td></tr>
+          EOF
+          fi
+
+          if [ "${{ needs.detect-stack.outputs.has_go }}" = "true" ]; then
+            cat >> email-body.html << EOF
+          <tr style="border-bottom:1px solid #e2e8f0;"><td style="padding:10px 0;font-weight:500;">Go 静态分析</td><td style="padding:10px 0;text-align:right;">$([ "$GO_VET_ISSUES" -eq 0 ] && echo '✅ 通过' || echo "⚠️ ${GO_VET_ISSUES} 个问题")</td></tr>
+          EOF
+          fi
+
+          cat >> email-body.html << EOF
+          </table>
+
+          <div style="margin-top:24px;padding:16px;background:#f0f9ff;border-radius:8px;text-align:center;">
+          <p style="margin:0;font-size:13px;color:#1e40af;font-weight:500;">📎 完整详细报告见附件</p>
+          </div>
+
+          <div style="margin-top:20px;text-align:center;">
+          <a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" style="color:#3b82f6;font-size:12px;">查看 GitHub Actions 运行日志 →</a>
+          </div>
+
+          </div></div></body></html>
+          EOF
+
+      - name: Get Microsoft Graph access token
+        id: get-token
+        run: |
+          TOKEN=$(curl -s -X POST \
+            "https://login.microsoftonline.com/${{ secrets.AZURE_TENANT_ID }}/oauth2/v2.0/token" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "client_id=${{ secrets.AZURE_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.AZURE_CLIENT_SECRET }}" \
+            -d "scope=https://graph.microsoft.com/.default" \
+            -d "grant_type=client_credentials" \
+            | jq -r '.access_token')
+
+          if [ "$TOKEN" = "null" ] || [ -z "$TOKEN" ]; then
+            echo "::error::Failed to obtain MS Graph access token"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Send email via Microsoft Graph API
+        run: |
+          EMAIL_BODY=$(cat email-body.html | jq -Rs .)
+          ATTACHMENT_CONTENT=$(base64 -w 0 full-report.html)
+
+          NOTIFY="${{ inputs.notify_email }}"
+          [ -z "$NOTIFY" ] && NOTIFY="${{ secrets.NOTIFY_EMAIL }}"
+
+          RECIPIENTS_JSON=$(echo "$NOTIFY" \
+            | tr ';,' '\n' \
+            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+            | grep -v '^$' \
+            | jq -R '{"emailAddress":{"address":.}}' \
+            | jq -s '.')
+
+          PAYLOAD=$(jq -n \
+            --arg subject "代码扫描周报 - ${{ github.repository }} - $(date -u '+%Y-%m-%d')" \
+            --argjson body "$EMAIL_BODY" \
+            --argjson recipients "$RECIPIENTS_JSON" \
+            --arg attachment "$ATTACHMENT_CONTENT" \
+            '{
+              message: {
+                subject: $subject,
+                body: { contentType: "HTML", content: $body },
+                toRecipients: $recipients,
+                attachments: [{
+                  "@odata.type": "#microsoft.graph.fileAttachment",
+                  name: "代码扫描完整报告.html",
+                  contentType: "text/html",
+                  contentBytes: $attachment
+                }]
+              },
+              saveToSentItems: "false"
+            }')
+
+          HTTP_STATUS=$(curl -s -o response.txt -w "%{http_code}" \
+            -X POST \
+            "https://graph.microsoft.com/v1.0/users/${{ secrets.MAIL_SENDER }}/sendMail" \
+            -H "Authorization: Bearer ${{ steps.get-token.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          if [ "$HTTP_STATUS" = "202" ]; then
+            echo "Email sent successfully via Microsoft Graph API"
+          else
+            echo "::error::Failed to send email. HTTP status: $HTTP_STATUS"
+            cat response.txt
+            exit 1
+          fi
