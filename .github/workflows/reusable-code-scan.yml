@@ -228,7 +228,6 @@ jobs:
           format: 'json'
           output: 'trivy-vuln-report.json'
           severity: ${{ inputs.trivy_severity }}
-          trivyignores: '.trivyignore'
 
       - name: Trivy - Configuration & IaC scan (JSON)
         if: needs.detect-stack.outputs.has_docker == 'true'
