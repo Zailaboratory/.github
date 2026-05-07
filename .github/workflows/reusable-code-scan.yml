@@ -59,6 +59,7 @@ on:
 permissions:
   contents: read
   security-events: write
+  actions: read
 
 jobs:
   detect-stack:
@@ -568,6 +569,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      actions: read
     strategy:
       fail-fast: false
       matrix:
